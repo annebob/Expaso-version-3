@@ -1,0 +1,93 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Start PostgreSQL service if enabled
+# ==============================================================================
+declare postgres_data
+declare update
+declare postgres_pid
+declare version_file
+
+postgres_data=/data/postgres
+version_file=/data/version
+update=false
+
+# Check if we need to update
+if [[ $(< ${version_file}) != $(bashio::addon.version) ]]; then
+	update=true
+fi
+
+# Start Postgres
+bashio::log.info "Starting PostgreSQL.."
+su - postgres -c "postgres -D ${postgres_data}" &
+postgres_pid=$!
+bashio::log.info "done"
+
+# Wait for postgres to become available..
+while ! psql -U "postgres" postgres -c "" 2> /dev/null; do
+	sleep 1
+done
+
+# Setup postgres user on first run
+if [[ -f "/data/firstrun" ]]; then
+	bashio::log.info "Setting up postgres user.."
+	psql -U "postgres" postgres -c "ALTER USER postgres WITH PASSWORD 'homeassistant';"
+fi
+
+# Check for extension updates..
+if bashio::var.true "${update}"; then
+
+	bashio::log.notice "Addon was updated to version: $(bashio::addon.version). Performing database upgrades..."
+
+	# Fetch all databases..
+	psql \
+		-X \
+		-U postgres \
+		-c "select datname from pg_database where datallowconn = true;" \
+		--set ON_ERROR_STOP=on \
+		--no-align \
+		-t \
+		--field-separator ' ' \
+		--quiet \
+	| while read datname; do
+		# Update Timescale when needed
+		psql -X -U postgres -d ${datname} -c "select 1 from pg_extension where extname = 'timescaledb';" | grep -q 1 \
+		&& bashio::log.info "Try updating Timescale Extension for database: '${datname}'.." \
+		&& psql -X -U postgres -d ${datname} -c "ALTER EXTENSION timescaledb UPDATE;" || true >> /var/log/timescaledb.upgrade.log
+
+		psql -X -U postgres -d ${datname} -c "select 1 from pg_extension where extname = 'postgis';" | grep -q 1 \
+		&& bashio::log.info "Try updating Postgis Extension for database: '${datname}'.." \
+		&& psql -X -U postgres -d ${datname} -c "SELECT PostGIS_Extensions_Upgrade();" || true >> /var/log/postgis.upgrade.log
+	done
+fi
+
+# Create all databases if not exist
+for database in $(bashio::config "databases"); do
+    bashio::log.info "Create database if not exist: '${database}'"
+	psql -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${database}'" | grep -q 1 || psql -U postgres -c "CREATE DATABASE ${database}"
+done
+bashio::log.info "done"
+
+# Enable the timescale-extensions for all indicated databases
+for database in $(bashio::config "timescale_enabled"); do
+	if ! (psql -X -U postgres -d ${database} -c "select 1 from pg_extension where extname = 'timescaledb';" | grep -q 1); then
+		bashio::log.info "Enabling Timescale Extension for database: '${database}'"
+		psql -U "postgres" -d ${database} -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;" || true >> /var/log/timescaledb.create.log
+	fi;
+done
+
+bashio::log.info "done"
+
+# Exit update mode
+rm -f /data/firstrun
+if bashio::var.true "${update}"; then
+	bashio::log.info "Exiting update mode and restarting.."
+	# Write new addon-version
+	bashio::addon.version > ${version_file}
+	sleep 3
+	bashio::addon.restart
+fi
+
+# And let it roll
+bashio::log.notice "TimescaleDb is running!"
+wait "${postgres_pid}"
